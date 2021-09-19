@@ -1,4 +1,4 @@
-# Contributing to Kopf
+cd ..# Contributing to Kopf
 
 **Thank you for your interest in Kopf. Your contributions are highly welcome.**
 

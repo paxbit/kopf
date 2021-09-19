@@ -1,7 +1,7 @@
 import abc
 import copy
 import json
-from typing import Any, Collection, Dict, Iterable, Optional, cast
+from typing import Any, Collection, Dict, Tuple, Iterable, Optional, cast
 
 from kopf._cogs.configs import conventions
 from kopf._cogs.structs import bodies, dicts, patches
@@ -9,7 +9,8 @@ from kopf._cogs.structs import bodies, dicts, patches
 
 class DiffBaseStorage(conventions.StorageKeyMarkingConvention,
                       conventions.StorageStanzaCleaner,
-                      metaclass=abc.ABCMeta):
+                      conventions.ResourceCaching,
+                      metaclass = abc.ABCMeta):
     """
     Store the base essence for diff calculations, i.e. last handled state.
 
@@ -63,10 +64,10 @@ class DiffBaseStorage(conventions.StorageKeyMarkingConvention,
             del essence['status']
 
         # We want some selected metadata to be tracked implicitly.
-        dicts.cherrypick(src=body, dst=essence, fields=[
+        dicts.cherrypick(src = body, dst = essence, fields = [
             'metadata.labels',
             'metadata.annotations',  # but not all of them! deleted below.
-        ], picker=copy.deepcopy)
+        ], picker = copy.deepcopy)
 
         # But we do not want all the annotations, only the potentially useful ones.
         # Also exclude the annotations of other Kopf-based operators' storages.
@@ -79,7 +80,7 @@ class DiffBaseStorage(conventions.StorageKeyMarkingConvention,
                 del annotations[annotation]
 
         # Restore all explicitly whitelisted extra-fields from the original body.
-        dicts.cherrypick(src=body, dst=essence, fields=extra_fields, picker=copy.deepcopy)
+        dicts.cherrypick(src = body, dst = essence, fields = extra_fields, picker = copy.deepcopy)
 
         self.remove_empty_stanzas(cast(bodies.BodyEssence, essence))
         return cast(bodies.BodyEssence, essence)
@@ -112,7 +113,7 @@ class AnnotationsDiffBaseStorage(conventions.StorageKeyFormingConvention, DiffBa
             key: str = 'last-handled-configuration',
             v1: bool = True,  # will be switched to False a few releases later
     ) -> None:
-        super().__init__(prefix=prefix, v1=v1)
+        super().__init__(prefix = prefix, v1 = v1)
         self.key = key
 
     def build(
@@ -121,8 +122,8 @@ class AnnotationsDiffBaseStorage(conventions.StorageKeyFormingConvention, DiffBa
             body: bodies.Body,
             extra_fields: Optional[Iterable[dicts.FieldSpec]] = None,
     ) -> bodies.BodyEssence:
-        essence = super().build(body=body, extra_fields=extra_fields)
-        self.remove_annotations(essence, set(self.make_keys(self.key, body=body)))
+        essence = super().build(body = body, extra_fields = extra_fields)
+        self.remove_annotations(essence, set(self.make_keys(self.key, body = body)))
         self.remove_empty_stanzas(essence)
         return essence
 
@@ -131,11 +132,38 @@ class AnnotationsDiffBaseStorage(conventions.StorageKeyFormingConvention, DiffBa
             *,
             body: bodies.Body,
     ) -> Optional[bodies.BodyEssence]:
-        for full_key in self.make_keys(self.key, body=body):
+
+        cache_entry: Optional[Tuple[int, bodies.BodyEssence]] = None
+        cached_revision: Optional[int] = None
+        cached_essence: Optional[bodies.BodyEssence] = None
+
+        if body.meta.uid:
+            cache_entry = self.__class__._patch_cache.get(body.meta.uid, None)
+
+        for full_key in self.make_keys(self.key, body = body):
             encoded = body.metadata.annotations.get(full_key, None)
             decoded = json.loads(encoded) if encoded is not None else None
-            if decoded is not None:
+
+            if cache_entry:
+                cached_revision, cached_essence = cache_entry
+
+            if decoded is None and cached_essence is not None:
+                return cached_essence
+
+            if decoded is not None and cached_essence is None:
                 return cast(bodies.BodyEssence, decoded)
+
+            rev_key = self.make_keys("diffbase-storage-revision")
+            stored_revision = int(body.metadata.annotations.get(rev_key[0], -1))
+
+            if stored_revision == cached_revision:
+                try:
+                    del self.__class__._patch_cache[body.meta.uid]
+                except KeyError:
+                    pass
+
+            return cached_essence
+
         return None
 
     def store(
@@ -145,11 +173,18 @@ class AnnotationsDiffBaseStorage(conventions.StorageKeyFormingConvention, DiffBa
             patch: patches.Patch,
             essence: bodies.BodyEssence,
     ) -> None:
-        encoded: str = json.dumps(essence, separators=(',', ':'))  # NB: no spaces
+        encoded: str = json.dumps(essence, separators = (',', ':'))  # NB: no spaces
         encoded += '\n'  # for better kubectl presentation without wrapping (same as kubectl's one)
-        for full_key in self.make_keys(self.key, body=body):
+        for full_key in self.make_keys(self.key, body = body):
             patch.metadata.annotations[full_key] = encoded
-        self._store_marker(prefix=self.prefix, patch=patch, body=body)
+        self._store_marker(prefix = self.prefix, patch = patch, body = body)
+
+        if body.meta.uid:
+            rev_key = self.make_keys("diffbase-storage-revision")
+            self.__class__._global_revision += 1
+            patch.metadata.annotations[rev_key[0]] = str(self.__class__._global_revision)
+
+            self.__class__._patch_cache[body.meta.uid] = (self.__class__._global_revision, essence)
 
 
 class StatusDiffBaseStorage(DiffBaseStorage):
@@ -162,7 +197,7 @@ class StatusDiffBaseStorage(DiffBaseStorage):
     ) -> None:
         super().__init__()
         self._name = name
-        real_field = field.format(name=self._name) if isinstance(field, str) else field
+        real_field = field.format(name = self._name) if isinstance(field, str) else field
         self._field = dicts.parse_field(real_field)
 
     @property
@@ -171,7 +206,7 @@ class StatusDiffBaseStorage(DiffBaseStorage):
 
     @field.setter
     def field(self, field: dicts.FieldSpec) -> None:
-        real_field = field.format(name=self._name) if isinstance(field, str) else field
+        real_field = field.format(name = self._name) if isinstance(field, str) else field
         self._field = dicts.parse_field(real_field)
 
     def build(
@@ -180,7 +215,7 @@ class StatusDiffBaseStorage(DiffBaseStorage):
             body: bodies.Body,
             extra_fields: Optional[Iterable[dicts.FieldSpec]] = None,
     ) -> bodies.BodyEssence:
-        essence = super().build(body=body, extra_fields=extra_fields)
+        essence = super().build(body = body, extra_fields = extra_fields)
 
         # Work around an issue with mypy not treating TypedDicts as MutableMappings.
         essence_dict = cast(Dict[Any, Any], essence)
@@ -205,7 +240,7 @@ class StatusDiffBaseStorage(DiffBaseStorage):
             essence: bodies.BodyEssence,
     ) -> None:
         # Store as a single string instead of full dict -- to avoid merges and unexpected data.
-        encoded: str = json.dumps(essence, separators=(',', ':'))  # NB: no spaces
+        encoded: str = json.dumps(essence, separators = (',', ':'))  # NB: no spaces
         dicts.ensure(patch, self.field, encoded)
 
 
@@ -224,11 +259,11 @@ class MultiDiffBaseStorage(DiffBaseStorage):
             body: bodies.Body,
             extra_fields: Optional[Iterable[dicts.FieldSpec]] = None,
     ) -> bodies.BodyEssence:
-        essence = super().build(body=body, extra_fields=extra_fields)
+        essence = super().build(body = body, extra_fields = extra_fields)
         for storage in self.storages:
             # Let the individual stores to also clean the essence from their own fields.
             # For this, assume the the previous essence _is_ the body (what's left of it).
-            essence = storage.build(body=bodies.Body(essence), extra_fields=extra_fields)
+            essence = storage.build(body = bodies.Body(essence), extra_fields = extra_fields)
         return essence
 
     def fetch(
@@ -237,7 +272,7 @@ class MultiDiffBaseStorage(DiffBaseStorage):
             body: bodies.Body,
     ) -> Optional[bodies.BodyEssence]:
         for storage in self.storages:
-            content = storage.fetch(body=body)
+            content = storage.fetch(body = body)
             if content is not None:
                 return content
         return None
@@ -250,4 +285,4 @@ class MultiDiffBaseStorage(DiffBaseStorage):
             essence: bodies.BodyEssence,
     ) -> None:
         for storage in self.storages:
-            storage.store(body=body, patch=patch, essence=essence)
+            storage.store(body = body, patch = patch, essence = essence)

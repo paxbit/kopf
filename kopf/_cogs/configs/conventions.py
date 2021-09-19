@@ -33,7 +33,7 @@ replaced; in some cases, they will be cut and hash-suffixed.
 import base64
 import hashlib
 import warnings
-from typing import Any, Collection, Iterable, Optional, Set
+from typing import Any, Collection, Iterable, Optional, Set, Dict, Tuple
 
 from kopf._cogs.structs import bodies, patches
 
@@ -144,7 +144,7 @@ class StorageKeyFormingConvention(CollisionEvadingConvention):
             warnings.warn("The annotations prefix is too long. It can cause errors when PATCHing.")
 
     def make_keys(self, key: str, *, body: Optional[bodies.Body] = None) -> Iterable[str]:
-        key = key if body is None else self.mark_key(key, body=body)
+        key = key if body is None else self.mark_key(key, body = body)
         v2_keys = [self.make_v2_key(key)]
         v1_keys = [self.make_v1_key(key)] if self.v1 else []
         return v2_keys + list(set(v1_keys) - set(v2_keys))
@@ -178,13 +178,13 @@ class StorageKeyFormingConvention(CollisionEvadingConvention):
         prefix = f'{self.prefix}/' if self.prefix else ''
         suffix = self.make_suffix(key) if len(key) > max_length else ''
         key_limit = max(0, max_length - len(suffix))
-        safe_key =  self.make_safe_key(key)
+        safe_key = self.make_safe_key(key)
         final_key = f'{prefix}{safe_key[:key_limit]}{suffix}'
         return final_key
 
     def make_suffix(self, key: str) -> str:
-        digest = hashlib.blake2b(key.encode('utf-8'), digest_size=4).digest()
-        alnums = base64.b64encode(digest, altchars=b'-.').decode('ascii')
+        digest = hashlib.blake2b(key.encode('utf-8'), digest_size = 4).digest()
+        alnums = base64.b64encode(digest, altchars = b'-.').decode('ascii')
         return f'-{alnums}'.rstrip('=-.')
 
 
@@ -286,3 +286,11 @@ class StorageStanzaCleaner:
             del essence['metadata']
         if 'status' in essence and not essence['status']:
             del essence['status']
+
+
+class ResourceCaching:
+    """
+    A mixin to allow in-memory resource caching through storage implementations.
+    """
+    _patch_cache: Dict[str, Tuple[int, bodies.BodyEssence]] = {}
+    _global_revision = 0

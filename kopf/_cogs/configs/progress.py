@@ -41,7 +41,7 @@ All timestamps are strings in ISO8601 format in UTC (no explicit ``Z`` suffix).
 import abc
 import copy
 import json
-from typing import Any, Collection, Dict, Mapping, Optional, cast
+from typing import Any, Collection, Dict, Mapping, Optional, cast, Tuple
 
 from typing_extensions import TypedDict
 
@@ -130,6 +130,7 @@ class ProgressStorage(conventions.StorageStanzaCleaner, metaclass=abc.ABCMeta):
 
 class AnnotationsProgressStorage(conventions.StorageKeyFormingConvention,
                                  conventions.StorageKeyMarkingConvention,
+                                 conventions.ResourceCaching,
                                  ProgressStorage):
     """
     State storage in ``.metadata.annotations`` with JSON-serialised content.
@@ -180,13 +181,47 @@ class AnnotationsProgressStorage(conventions.StorageKeyFormingConvention,
             key: ids.HandlerId,
             body: bodies.Body,
     ) -> Optional[ProgressRecord]:
+
+        cache_entry: Optional[Tuple[int, ProgressRecord]] = None
+        cached_revision: Optional[int] = None
+        cached_essence: Optional[ProgressRecord] = None
+
+        if body.meta.uid:
+            cache_entry = self.__class__._patch_cache.get(body.meta.uid + key, None)
+
         for full_key in self.make_keys(key, body=body):
-            key_field = ['metadata', 'annotations', full_key]
+            key_field = ["metadata", "annotations", full_key]
             encoded = dicts.resolve(body, key_field, None)
             decoded = json.loads(encoded) if encoded is not None else None
-            if decoded is not None:
+
+            if cache_entry:
+                cached_revision, cached_essence = cache_entry
+
+            if decoded is None and cached_essence is not None:
+                return cached_essence
+
+            if decoded is not None and cached_essence is None:
                 return cast(ProgressRecord, decoded)
+
+            rev_key = self.make_keys("progress-storage-revision-" + key)
+            stored_revision = int(body.metadata.annotations.get(rev_key[0], -1))
+
+            if stored_revision == cached_revision:
+                try:
+                    del self.__class__._patch_cache[body.meta.uid]
+                except KeyError:
+                    pass
+
+            return cached_essence
+
         return None
+
+    def _update_patch_cache(self, body, key, patch, record):
+        if body.meta.uid:
+            rev_key = self.make_keys("diffbase-storage-revision-" + key)
+            self.__class__._global_revision += 1
+            patch.metadata.annotations[rev_key[0]] = str(self.__class__._global_revision)
+            self.__class__._patch_cache[body.meta.uid + key] = (self.__class__._global_revision, record)
 
     def store(
             self,
@@ -203,6 +238,8 @@ class AnnotationsProgressStorage(conventions.StorageKeyFormingConvention,
             dicts.ensure(patch, key_field, encoded)
         self._store_marker(prefix=self.prefix, patch=patch, body=body)
 
+        self._update_patch_cache(body, key, patch, record)
+
     def purge(
             self,
             *,
@@ -212,13 +249,23 @@ class AnnotationsProgressStorage(conventions.StorageKeyFormingConvention,
     ) -> None:
         absent = object()
         for full_key in self.make_keys(key, body=body):
-            key_field = ['metadata', 'annotations', full_key]
+            key_field = ["metadata", "annotations", full_key]
             body_value = dicts.resolve(body, key_field, absent)
             patch_value = dicts.resolve(patch, key_field, absent)
             if body_value is not absent:
                 dicts.ensure(patch, key_field, None)
             elif patch_value is not absent:
                 dicts.remove(patch, key_field)
+
+            rev_key = self.make_keys("diffbase-storage-revision-" + key)
+            try:
+                del patch.metadata.annotations[rev_key[0]]
+            except KeyError:
+                pass
+            try:
+                del self.__class__._patch_cache[body.meta.uid + key]
+            except KeyError:
+                pass
 
     def touch(
             self,
